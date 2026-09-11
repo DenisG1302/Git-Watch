@@ -71,6 +71,10 @@ def create_app(directory=None, watcher=None):
     def add_repo():
         return jsonify(watcher.add_repo(body(('url','mode','branch','interval_minutes')))),201
 
+    @app.post('/api/repos/branches')
+    def branch_choices():
+        return jsonify(watcher.branch_choices(body(('url',)).get('url', '')))
+
     @app.patch('/api/repos/<int:repo_id>')
     def update_repo(repo_id):
         watcher.update_repo(repo_id,body(('mode','branch','interval_minutes','enabled','revision')))

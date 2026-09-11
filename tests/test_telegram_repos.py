@@ -23,6 +23,7 @@ class TelegramRepositoryTests(unittest.TestCase):
     def mock_external(self, watcher):
         watcher.github = Mock()
         watcher.github.metadata.side_effect = lambda name: {'full_name':name, 'description':''}
+        watcher.github.heads.return_value = {'main':'a'*40, 'feature/my-branch':'b'*40, 'missing-branch':'c'*40}
         watcher._send = Mock()
 
     def configure(self, **changes):

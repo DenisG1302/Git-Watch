@@ -85,6 +85,17 @@ class Watcher:
             'github':self.store.meta('github', {}),
         }
 
+    def branch_choices(self, value):
+        name = parse_repo(value)
+        metadata = self.github.metadata(name)
+        name = parse_repo(metadata['full_name'])
+        default = metadata.get('default_branch') or ''
+        heads = self.github.heads({'full_name':name, 'mode':'all'})
+        if not isinstance(heads, dict) or any(not isinstance(branch, str) or not branch for branch in heads):
+            raise RemoteError('GitHub вернул некорректный список веток. Обнови список.')
+        branches = sorted(heads, key=lambda branch:(branch != default, branch.casefold(), branch))
+        return {'full_name':name, 'default_branch':default, 'branches':branches}
+
     def add_repo(self, body):
         name, mode, branch, interval = validate_repo(body)
         with self.store.transaction() as db:

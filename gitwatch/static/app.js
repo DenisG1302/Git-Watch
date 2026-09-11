@@ -4,6 +4,7 @@ const esc=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&
 const shortTime=value=>value?new Date(value*1000).toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'Ещё не было';
 const intervalLabel=minutes=>minutes<60?`${minutes} мин`:minutes%60===0?`${minutes/60} ч`:`${minutes} мин`;
 let state=null,refreshBusy=false,toastTimer,settingsRevision=0,editingRepo=null,deleteId=null;
+let branchTimer=null,branchWanted='',repoSaving=false;
 const emptyRepos=$('#repo-list').innerHTML,emptyEvents=$('#events-list').innerHTML;
 const kinds={push:'Новый пуш',rewrite:'История ветки изменена',branch_created:'Новая ветка',branch_deleted:'Ветка удалена'};
 const deliveries={pending:['В очереди','warning'],sent:['В Telegram','good'],disabled:['Telegram не настроен',''],skipped:['Без отправки','']};
@@ -44,11 +45,41 @@ function render(){
   if(rate.retry_at>state.now){$('#global-error').textContent='Пауза по лимиту GitHub до '+shortTime(rate.retry_at)+'. Проверки возобновятся автоматически.';$('#global-error').hidden=false;}else{$('#global-error').hidden=true;}
 }
 async function refresh(){if(refreshBusy)return;refreshBusy=true;try{state=await api('/api/state');render();}catch(error){$('#global-error').textContent='Не удалось обновить данные. '+error.message;$('#global-error').hidden=false;$('#service-status').textContent='Нет связи с устройством';$('#service-status').className='service-pill';}finally{refreshBusy=false;}}
+function repoUrl(){return $('#repo-form').elements.url.value.trim().replace(/\/+$/,'');}
+function branchAvailability(data){
+  const form=$('#repo-form'),specific=form.elements.mode.value==='branch';
+  $('#branch-field').hidden=!specific;form.elements.branch.required=specific;
+  $('#save-repo').disabled=repoSaving||(specific&&(data.loading||!data.loaded||!form.elements.branch.value));
+  $('#refresh-branches').disabled=repoSaving||data.loading||!repoUrl();
+}
+function renderBranchChoices(data){
+  const form=$('#repo-form'),select=form.elements.branch,status=$('#branch-status');
+  const savedMissing=data.loaded&&editingRepo?.mode==='branch'&&editingRepo.url===data.url&&branchWanted===editingRepo.branch&&!data.branches.includes(branchWanted);
+  let placeholder=data.loading?'Загрузка веток…':data.error?'Не удалось загрузить ветки':data.loaded?'В репозитории пока нет веток':'Сначала укажи ссылку на репозиторий';
+  select.innerHTML=`<option value="">${placeholder}</option>`+data.branches.map(branch=>`<option value="${esc(branch)}">${esc(branch)}${branch===data.defaultBranch?' — основная':''}</option>`).join('');
+  if(savedMissing)select.innerHTML+=`<option value="${esc(branchWanted)}">${esc(branchWanted)} — сохранённая, сейчас не найдена</option>`;
+  if(data.loaded){
+    select.value=data.branches.includes(branchWanted)||savedMissing?branchWanted:data.branches.includes(data.defaultBranch)?data.defaultBranch:data.branches[0]||'';
+    branchWanted=select.value;
+  }
+  select.disabled=repoSaving||data.loading||!data.loaded||(!data.branches.length&&!savedMissing);
+  select.setAttribute('aria-busy',String(data.loading));
+  status.className=data.error?'form-error':'field-help';
+  status.textContent=data.loading?'Загружаем ветки с GitHub…':data.error?data.error:savedMissing?'Сохранённая ветка сейчас отсутствует на GitHub. Можно оставить наблюдение за ней или выбрать другую.':data.loaded?(data.branches.length?`Найдено веток: ${data.branches.length}.${data.defaultBranch?' Основная: '+data.defaultBranch+'.':''}`:'В репозитории пока нет веток. Можно выбрать «Все ветки».'):'Вставь ссылку на репозиторий — список загрузится автоматически.';
+  branchAvailability(data);
+}
+const branchLoader=new GitWatchBranchLoader(url=>api('/api/repos/branches','POST',{url}),renderBranchChoices);
+function requestBranches(force=false){
+  clearTimeout(branchTimer);const url=repoUrl();
+  if(!/^(?:https:\/\/github\.com\/|github\.com\/)?[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(url))return;
+  if(!force&&branchLoader.state.url===url&&(branchLoader.state.loading||branchLoader.state.loaded))return;
+  branchLoader.load(url);
+}
 function openRepo(repo=null){
   const form=$('#repo-form');form.reset();editingRepo=repo?{...repo}:null;errorIn(form,null);
   $('#repo-dialog-title').textContent=repo?'Настройки репозитория':'Добавить репозиторий';
-  form.elements.url.disabled=!!repo;form.elements.url.value=repo?.url||'';form.elements.mode.value=repo?.mode||'all';form.elements.branch.value=repo?.branch||'';form.elements.interval_minutes.value=repo?.interval_minutes||5;
-  $('#branch-field').hidden=form.elements.mode.value!=='branch';form.elements.branch.required=form.elements.mode.value==='branch';$('#repo-dialog').showModal();
+  form.elements.url.disabled=!!repo;form.elements.url.value=repo?.url||'';form.elements.mode.value=repo?.mode||'all';branchWanted=repo?.branch||'';form.elements.interval_minutes.value=repo?.interval_minutes||5;
+  branchLoader.reset(repoUrl());$('#repo-dialog').showModal();requestBranches();
 }
 function openSettings(){
   if(!state){toast('Дождись соединения с устройством.',true);return;}
@@ -74,8 +105,13 @@ document.addEventListener('click',async event=>{
     await refresh();
   }catch(error){toast(error.message,true);}finally{button.disabled=false;}
 });
-$('#repo-form [name=mode]').addEventListener('change',event=>{$('#branch-field').hidden=event.target.value!=='branch';$('#repo-form').elements.branch.required=event.target.value==='branch';});
-$('#repo-form').addEventListener('submit',event=>{event.preventDefault();const form=event.currentTarget;submit(form,async()=>{const data={mode:form.elements.mode.value,branch:form.elements.branch.value,interval_minutes:Number(form.elements.interval_minutes.value)};if(editingRepo){data.revision=editingRepo.revision;await api(`/api/repos/${editingRepo.id}`,'PATCH',data);}else{data.url=form.elements.url.value;await api('/api/repos','POST',data);}$('#repo-dialog').close();toast(editingRepo?'Настройки сохранены.':'Репозиторий добавлен. Начинаем наблюдение.');});});
+$('#repo-form [name=mode]').addEventListener('change',()=>{branchAvailability(branchLoader.state);requestBranches();});
+$('#repo-form [name=url]').addEventListener('input',()=>{clearTimeout(branchTimer);branchWanted='';branchLoader.reset(repoUrl());branchTimer=setTimeout(requestBranches,650);});
+$('#repo-form [name=url]').addEventListener('change',()=>requestBranches());
+$('#repo-form [name=branch]').addEventListener('change',event=>{branchWanted=event.target.value;branchAvailability(branchLoader.state);});
+$('#refresh-branches').addEventListener('click',()=>requestBranches(true));
+$('#repo-dialog').addEventListener('close',()=>{clearTimeout(branchTimer);branchLoader.reset();});
+$('#repo-form').addEventListener('submit',async event=>{event.preventDefault();const form=event.currentTarget;repoSaving=true;await submit(form,async()=>{const data={mode:form.elements.mode.value,branch:form.elements.branch.value,interval_minutes:Number(form.elements.interval_minutes.value)};if(data.mode==='branch'&&(!branchLoader.state.loaded||branchLoader.state.loading||!data.branch))throw new Error('Дождись загрузки веток и выбери ветку из списка.');if(editingRepo){data.revision=editingRepo.revision;await api(`/api/repos/${editingRepo.id}`,'PATCH',data);}else{data.url=form.elements.url.value;await api('/api/repos','POST',data);}$('#repo-dialog').close();toast(editingRepo?'Настройки сохранены.':'Репозиторий добавлен. Начинаем наблюдение.');});repoSaving=false;branchAvailability(branchLoader.state);});
 $('#telegram-form').addEventListener('submit',event=>{event.preventDefault();const form=event.currentTarget;submit(form,async()=>{await api('/api/telegram','PUT',{token:form.elements.token.value.trim(),username:form.elements.username.value.trim(),revision:settingsRevision});form.elements.token.value='';$('#settings-dialog').close();toast('Telegram сохранён. Отправь боту /start для привязки.');});});
 $('#github-form').addEventListener('submit',event=>{event.preventDefault();const form=event.currentTarget;submit(form,async()=>{if(!form.elements.token.value.trim())throw new Error('Введи GitHub-токен. Для удаления используй отдельную кнопку.');await api('/api/github','PUT',{token:form.elements.token.value.trim(),revision:settingsRevision});form.elements.token.value='';$('#settings-dialog').close();toast('GitHub-токен сохранён.');});});
 $('#confirm-form').addEventListener('submit',event=>{event.preventDefault();submit(event.currentTarget,async()=>{await api(`/api/repos/${deleteId}`,'DELETE');$('#confirm-dialog').close();toast('Репозиторий удалён.');});});
