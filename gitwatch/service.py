@@ -8,6 +8,7 @@ import time
 from urllib.parse import quote
 from .clients import GitHub, InputError, RemoteError, Telegram, event_text, parse_repo, validate_repo
 from .store import Store
+from .telegram_repos import MAIN_KEYBOARD, RepositoryDialogue
 
 log = logging.getLogger('gitwatch')
 
@@ -21,6 +22,7 @@ class Watcher:
             raise ValueError('Invalid telegram-proxy.json; expected an http/https proxy mapping')
         self.github = GitHub(self.store)
         self.telegram = Telegram(proxies)
+        self.repo_dialogue = RepositoryDialogue(self)
         self.stop_event = threading.Event()
         self.wake = threading.Event()
         self.tg_lock = threading.RLock()
@@ -222,6 +224,7 @@ class Watcher:
                 if changed:
                     current.update(chat_id=0,binding_after=int(time.time()),offset=0,generation=current['generation']+1)
                     db.execute("UPDATE events SET delivery='skipped',error='Получатель Telegram изменён.' WHERE delivery='pending'")
+                    db.execute("DELETE FROM meta WHERE key='telegram_add_repo'")
                 self.store.save_settings(current,db)
             self.store.put_meta('tg_poll',{})
             self.store.put_meta('tg_send',{})
@@ -232,6 +235,7 @@ class Watcher:
             current.update(telegram_token='',username='',bot_username='',chat_id=0,offset=0,generation=current['generation']+1,revision=current['revision']+1)
             self.store.save_settings(current,db)
             db.execute("UPDATE events SET delivery='skipped',error='Telegram отключён.' WHERE delivery='pending'")
+            db.execute("DELETE FROM meta WHERE key='telegram_add_repo'")
         self.store.put_meta('tg_poll',{})
         self.store.put_meta('tg_send',{})
 
@@ -264,7 +268,7 @@ class Watcher:
             return
         payload = {'chat_id':settings['chat_id'],'text':text,'parse_mode':'HTML','link_preview_options':{'is_disabled':True}}
         if keyboard:
-            payload['reply_markup'] = {'keyboard':[['📊 Статус','↻ Проверить']],'resize_keyboard':True}
+            payload['reply_markup'] = {'keyboard':MAIN_KEYBOARD if keyboard is True else keyboard,'resize_keyboard':True}
         try:
             self.telegram.call(settings['telegram_token'],'sendMessage',payload)
         except RemoteError as exc:
@@ -331,11 +335,15 @@ class Watcher:
                 current['chat_id'] = user_id
                 self.store.save_settings(current,db)
                 settings = current
+        if command == '/start':
+            self.repo_dialogue.clear()
         if command in ('/start','/help'):
-            self._send(settings,'<b>Git Watch</b>\nЛичный чат привязан. Доступ разрешён только тебе.\n\n/status — состояние репозиториев\n/check — проверить сейчас\n/repos — список репозиториев',keyboard=True)
+            self._send(settings,'<b>Git Watch</b>\nЛичный чат привязан. Доступ разрешён только тебе.\n\n/add — добавить репозиторий\n/status — состояние репозиториев\n/check — проверить сейчас\n/repos — список репозиториев\n/cancel — отменить добавление\n\nМожно просто прислать ссылку на GitHub. Незавершённое добавление продолжается командой /add.',keyboard=self.repo_dialogue.keyboard(settings))
+        elif self.repo_dialogue.handle(update,settings,text,command):
+            return True
         elif command == '/check' or text == '↻ Проверить':
             self.request_check()
-            self._send(settings,'Проверка активных репозиториев запрошена. Новые изменения придут отдельными сообщениями.',keyboard=True)
+            self._send(settings,'Проверка активных репозиториев запрошена. Новые изменения придут отдельными сообщениями.',keyboard=self.repo_dialogue.keyboard(settings))
         elif command in ('/status','/repos') or text == '📊 Статус':
             repos = self.store.repos()
             lines = ['<b>Git Watch · Статус</b>',f'Активны: {sum(bool(r["enabled"]) for r in repos)} из {len(repos)}','']
@@ -345,10 +353,10 @@ class Watcher:
             if len(repos)>20:
                 lines.append('Остальные репозитории доступны на сайте.')
             if not repos:
-                lines.append('Добавь репозиторий на сайте, чтобы начать наблюдение.')
-            self._send(settings,'\n'.join(lines),keyboard=True)
+                lines.append('Нажми «➕ Добавить репозиторий» или отправь /add, чтобы начать наблюдение.')
+            self._send(settings,'\n'.join(lines),keyboard=self.repo_dialogue.keyboard(settings))
         elif text:
-            self._send(settings,'Доступные команды: /status, /repos, /check.',keyboard=True)
+            self._send(settings,'Доступные команды: /add, /status, /repos, /check, /cancel. Для продолжения добавления отправь /add.',keyboard=self.repo_dialogue.keyboard(settings))
         return True
 
     def deliver_once(self):
