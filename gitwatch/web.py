@@ -4,6 +4,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from werkzeug.exceptions import HTTPException
 from .clients import InputError, RemoteError
 from .service import Watcher
+from .i18n import translate, translate_snapshot
 
 def create_app(directory=None, watcher=None):
     app = Flask(__name__, static_folder='static')
@@ -12,16 +13,22 @@ def create_app(directory=None, watcher=None):
     watcher = watcher or Watcher(directory or os.getenv('GITWATCH_DATA', str(Path(__file__).resolve().parent.parent/'data')))
     app.extensions['watcher'] = watcher
 
+    def language():
+        return request.accept_languages.best_match(('en', 'ru'), default='ru')
+
+    def message(value):
+        return translate(value, language())
+
     @app.before_request
     def protect_request():
         if request.method not in ('GET','HEAD','OPTIONS'):
             if request.headers.get('X-GitWatch') != '1' or request.headers.get('Sec-Fetch-Site') == 'cross-site':
-                return jsonify(error='Запрос отклонён. Открой сайт напрямую и повтори.'),403
+                return jsonify(error=message('Запрос отклонён. Открой сайт напрямую и повтори.')),403
             origin = request.headers.get('Origin')
             if origin and origin != request.host_url.rstrip('/'):
-                return jsonify(error='Запрос с другого сайта отклонён.'),403
+                return jsonify(error=message('Запрос с другого сайта отклонён.')),403
             if not request.is_json:
-                return jsonify(error='Ожидается JSON-запрос.'),415
+                return jsonify(error=message('Ожидается JSON-запрос.')),415
 
     @app.after_request
     def security_headers(response):
@@ -30,24 +37,27 @@ def create_app(directory=None, watcher=None):
         response.headers['X-Frame-Options'] = 'SAMEORIGIN'
         response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
         response.headers['Cache-Control'] = 'no-store' if request.path.startswith('/api/') else 'no-cache'
+        if request.path.startswith('/api/'):
+            response.headers['Content-Language'] = language()
+            response.vary.add('Accept-Language')
         return response
 
     @app.errorhandler(InputError)
     def input_error(exc):
-        return jsonify(error=str(exc)),400
+        return jsonify(error=message(str(exc))),400
 
     @app.errorhandler(RemoteError)
     def remote_error(exc):
-        return jsonify(error=str(exc),retry_at=exc.retry_at),502
+        return jsonify(error=message(str(exc)),retry_at=exc.retry_at),502
 
     @app.errorhandler(HTTPException)
     def http_error(exc):
-        return jsonify(error='Запрос не выполнен. Проверь адрес и данные.',status=exc.code),exc.code
+        return jsonify(error=message('Запрос не выполнен. Проверь адрес и данные.'),status=exc.code),exc.code
 
     @app.errorhandler(Exception)
     def internal_error(exc):
         app.logger.error('Request failed: %s',type(exc).__name__)
-        return jsonify(error='Не удалось выполнить запрос. Обнови страницу и повтори.'),500
+        return jsonify(error=message('Не удалось выполнить запрос. Обнови страницу и повтори.')),500
 
     def body(allowed):
         data = request.get_json()
@@ -65,7 +75,7 @@ def create_app(directory=None, watcher=None):
 
     @app.get('/api/state')
     def state():
-        return jsonify(watcher.snapshot())
+        return jsonify(translate_snapshot(watcher.snapshot(), language()))
 
     @app.post('/api/repos')
     def add_repo():

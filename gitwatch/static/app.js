@@ -1,17 +1,26 @@
 'use strict';
 const $=(s,root=document)=>root.querySelector(s);
 const esc=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
-const shortTime=value=>value?new Date(value*1000).toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'Ещё не было';
-const intervalLabel=minutes=>minutes<60?`${minutes} мин`:minutes%60===0?`${minutes/60} ч`:`${minutes} мин`;
-let state=null,refreshBusy=false,toastTimer,settingsRevision=0,editingRepo=null,deleteId=null;
+let preferenceStorage;
+try { preferenceStorage = window.localStorage; } catch { /* Storage may be disabled. */ }
+const i18n = GitWatchI18n.create({storage:preferenceStorage,languages:navigator.languages || [navigator.language]});
+const t = i18n.t;
+function translatedEmpty(markup) {
+  const container=document.createElement('div');container.innerHTML=markup;i18n.apply(container);return container.innerHTML;
+}
+const shortTime=value=>value?new Date(value*1000).toLocaleString(i18n.locale,{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):t('never');
+const intervalLabel=minutes=>minutes%60===0?t('hours',{count:minutes/60}):t('minutes',{count:minutes});
+let state=null,refreshBusy=false,refreshQueued=false,toastTimer,settingsRevision=0,editingRepo=null,deleteId=null;
 let branchTimer=null,branchWanted='',repoSaving=false;
 const emptyRepos=$('#repo-list').innerHTML,emptyEvents=$('#events-list').innerHTML;
-const kinds={push:'Новый пуш',rewrite:'История ветки изменена',branch_created:'Новая ветка',branch_deleted:'Ветка удалена'};
-const deliveries={pending:['В очереди','warning'],sent:['В Telegram','good'],disabled:['Telegram не настроен',''],skipped:['Без отправки','']};
+const kinds={push:'push',rewrite:'rewrite',branch_created:'branchCreated',branch_deleted:'branchDeleted'};
+const deliveries={pending:['queued','warning'],sent:['sent','good'],disabled:['telegramDisabled',''],skipped:['skipped','']};
 async function api(path,method='GET',body){
-  const response=await fetch(path,{method,headers:method==='GET'?{}:{'Content-Type':'application/json','X-GitWatch':'1'},body:method==='GET'?undefined:JSON.stringify(body??{}),signal:AbortSignal.timeout(90000)});
-  let data;try{data=await response.json();}catch{throw new Error('Сервер вернул неполный ответ. Повтори запрос.');}
-  if(!response.ok)throw new Error(data.error||'Не удалось выполнить запрос.');
+  let response;
+  try { response=await fetch(path,{method,headers:{'Accept-Language':i18n.language,...(method==='GET'?{}:{'Content-Type':'application/json','X-GitWatch':'1'})},body:method==='GET'?undefined:JSON.stringify(body??{}),signal:AbortSignal.timeout(90000)}); }
+  catch { throw new Error(t('networkError')); }
+  let data;try{data=await response.json();}catch{throw new Error(t('incompleteResponse'));}
+  if(!response.ok)throw new Error(data.error||t('requestError'));
   return data;
 }
 function toast(message,error=false){clearTimeout(toastTimer);const node=$('#toast');node.textContent=message;node.className='toast'+(error?' error':'');node.hidden=false;toastTimer=setTimeout(()=>node.hidden=true,5000);}
@@ -20,31 +29,45 @@ async function submit(form,action){
   const buttons=[...form.querySelectorAll('button')];buttons.forEach(b=>b.disabled=true);errorIn(form,null);
   try{await action();await refresh();}catch(error){errorIn(form,error);}finally{buttons.forEach(b=>b.disabled=false);}
 }
-function nextCheck(repo){if(!repo.enabled)return 'На паузе';if(repo.checking)return 'Проверяем GitHub…';const retry=Math.max(repo.next_check,state.github.retry_at||0);const seconds=Math.ceil(retry-state.now);return seconds<=0?'Проверка в очереди':seconds<60?`Через ${seconds} сек`:`Через ${Math.ceil(seconds/60)} мин`;}
+function nextCheck(repo){if(!repo.enabled)return t('paused');if(repo.checking)return t('checkingGithub');const retry=Math.max(repo.next_check,state.github.retry_at||0);const seconds=Math.ceil(retry-state.now);return seconds<=0?t('checkQueued'):seconds<60?t('inSeconds',{count:seconds}):t('inMinutes',{count:Math.ceil(seconds/60)});}
 function render(){
   $('#stat-active').textContent=state.stats.active;$('#stat-events').textContent=state.stats.events;$('#stat-pending').textContent=state.stats.pending;
   $('#repo-count').textContent=state.repos.length;$('#check-all').disabled=!state.stats.active;
-  $('#service-status').textContent=state.running?'Мониторинг работает':'Мониторинг не запущен';$('#service-status').className='service-pill'+(state.running?' live':'');
+  $('#service-status').textContent=state.running?t('running'):t('stopped');$('#service-status').className='service-pill'+(state.running?' live':'');
   $('#repo-list').innerHTML=state.repos.length?state.repos.map(repo=>{
     const [owner,...rest]=repo.full_name.split('/');
-    const branches=Object.keys(repo.heads||{});const mode=repo.mode==='all'?`Все ветки${repo.initialized?' · '+branches.length:''}`:repo.mode==='default'?`Основная ветка${branches[0]?' · '+branches[0]:''}`:repo.branch;
-    const badge=!repo.enabled?['Пауза','']:repo.checking?['Проверяем','']:repo.last_error?['Нужна проверка','bad']:repo.initialized?['Наблюдение','good']:['Первый опрос','warning'];
-    return `<article class="repo-row"><div class="repo-top"><div><a class="repo-title" href="${esc(repo.url)}" target="_blank" rel="noopener noreferrer"><span class="repo-owner">${esc(owner)} / </span>${esc(rest.join('/'))}</a><div class="repo-meta"><span class="branch-count">⑂ ${esc(mode)}</span><span>Каждые ${intervalLabel(repo.interval_minutes)}</span></div></div><div class="repo-controls"><button class="icon-button" data-action="check" data-id="${repo.id}" title="Проверить сейчас" aria-label="Проверить ${esc(repo.full_name)}" ${!repo.enabled?'disabled':''}>↻</button><button class="icon-button" data-action="toggle" data-id="${repo.id}" title="${repo.enabled?'Приостановить':'Возобновить'}" aria-label="${repo.enabled?'Приостановить':'Возобновить'} ${esc(repo.full_name)}">${repo.enabled?'Ⅱ':'▷'}</button><button class="icon-button" data-action="edit" data-id="${repo.id}" title="Настройки" aria-label="Настройки ${esc(repo.full_name)}">⚙</button><button class="icon-button" data-action="delete" data-id="${repo.id}" title="Удалить" aria-label="Удалить ${esc(repo.full_name)}">×</button></div></div>${repo.last_error?`<div class="repo-message">${esc(repo.last_error)}</div>`:''}<div class="repo-bottom"><span class="badge ${badge[1]}">${badge[0]}</span><span title="Последняя проверка: ${shortTime(repo.last_checked)}">${esc(nextCheck(repo))} · ${shortTime(repo.last_checked)}</span></div></article>`;
-  }).join(''):emptyRepos;
+    const branches=Object.keys(repo.heads||{});const mode=repo.mode==='all'?`${t('allBranches')}${repo.initialized?' · '+branches.length:''}`:repo.mode==='default'?`${t('defaultBranch')}${branches[0]?' · '+branches[0]:''}`:repo.branch;
+    const badge=!repo.enabled?[t('paused'),'']:repo.checking?[t('checking'),'']:repo.last_error?[t('needsAttention'),'bad']:repo.initialized?[t('watchingBadge'),'good']:[t('firstCheck'),'warning'];
+    return `<article class="repo-row"><div class="repo-top"><div><a class="repo-title" href="${esc(repo.url)}" target="_blank" rel="noopener noreferrer"><span class="repo-owner">${esc(owner)} / </span>${esc(rest.join('/'))}</a><div class="repo-meta"><span class="branch-count">⑂ ${esc(mode)}</span><span>${esc(t('every',{interval:intervalLabel(repo.interval_minutes)}))}</span></div></div><div class="repo-controls"><button class="icon-button" data-action="check" data-id="${repo.id}" title="${esc(t('checkNow'))}" aria-label="${esc(t('checkRepo',{name:repo.full_name}))}" ${!repo.enabled?'disabled':''}>↻</button><button class="icon-button" data-action="toggle" data-id="${repo.id}" title="${repo.enabled?t('pause'):t('resume')}" aria-label="${repo.enabled?t('pause'):t('resume')} ${esc(repo.full_name)}">${repo.enabled?'Ⅱ':'▷'}</button><button class="icon-button" data-action="edit" data-id="${repo.id}" title="${esc(t('settings'))}" aria-label="${esc(t('repoSettings',{name:repo.full_name}))}">⚙</button><button class="icon-button" data-action="delete" data-id="${repo.id}" title="${esc(t('remove'))}" aria-label="${esc(t('removeRepo',{name:repo.full_name}))}">×</button></div></div>${repo.last_error?`<div class="repo-message">${esc(repo.last_error)}</div>`:''}<div class="repo-bottom"><span class="badge ${badge[1]}">${badge[0]}</span><span title="${esc(t('lastChecked',{time:shortTime(repo.last_checked)}))}">${esc(nextCheck(repo))} · ${shortTime(repo.last_checked)}</span></div></article>`;
+  }).join(''):translatedEmpty(emptyRepos);
   const tg=state.settings.telegram;
-  $('#tg-badge').textContent=tg.error?'Ошибка связи':tg.connected?'Подключён':tg.configured?'Ждём /start':'Не настроен';
+  $('#tg-badge').textContent=tg.error?t('connectionError'):tg.connected?t('connected'):tg.configured?t('waitingStart'):t('notConfigured');
   $('#tg-badge').className='badge '+(tg.error?'bad':tg.connected?'good':tg.configured?'warning':'');
-  $('#tg-content').innerHTML=tg.configured?`<div class="username">@${esc(tg.username)}</div><p>${tg.connected?'Бот присылает изменения в твой личный чат и отвечает на команды.':'Открой бота и отправь <code>/start</code> со своего аккаунта для привязки чата.'}</p>${tg.error?`<p class="repo-message">${esc(tg.error)}</p>`:''}`:'<h3>Пуш в GitHub. Сообщение тебе.</h3><p>Подключи бота и укажи свой @ник, чтобы получать уведомления в личном чате.</p>';
-  if(tg.proxy_enabled)$('#tg-content').innerHTML+='<span class="badge">Через прокси</span>';
-  $('#tg-settings-button').textContent=tg.configured?'Настройки бота':'Подключить Telegram';
+  $('#tg-content').innerHTML=tg.configured?`<div class="username">@${esc(tg.username)}</div><p>${tg.connected?t('botConnected'):t('botWaiting')}</p>${tg.error?`<p class="repo-message">${esc(tg.error)}</p>`:''}`:'<h3>'+t('telegramPitch')+'</h3><p>'+t('telegramIntro')+'</p>';
+  if(tg.proxy_enabled)$('#tg-content').innerHTML+='<span class="badge">'+t('viaProxy')+'</span>';
+  $('#tg-settings-button').textContent=tg.configured?t('botSettings'):t('connectTelegram');
   $('#bot-link').hidden=!tg.bot_username;$('#bot-link').href=tg.bot_username?`https://t.me/${encodeURIComponent(tg.bot_username)}?start=gitwatch`:'#';$('#tg-test').hidden=!tg.connected;
-  $('#events-list').innerHTML=state.events.length?state.events.map(event=>{const delivery=deliveries[event.delivery]||['—',''];return `<article class="event-row"><span class="event-icon" aria-hidden="true">${event.kind==='branch_deleted'?'−':'⑂'}</span><div><div class="event-title">${esc(kinds[event.kind]||'Изменения')} · <a href="${esc(event.url)}" target="_blank" rel="noopener noreferrer">${esc(event.full_name)}</a></div><div class="event-detail">⑂ ${esc(event.branch)}${event.sha?' · <code>'+esc(event.sha.slice(0,8))+'</code>':''}${event.commit_count!==null?' · Коммитов: '+event.commit_count:''}</div>${event.summary?'<div class="event-detail">'+esc(event.summary)+'</div>':''}${event.error?'<div class="event-detail">'+esc(event.error)+'</div>':''}</div><div class="event-time"><time>${shortTime(event.created)}</time><span class="badge ${delivery[1]}">${delivery[0]}</span></div></article>`;}).join(''):emptyEvents;
-  $('#activity-note').textContent=state.events.length?'Последние 60 событий · хранение 90 дней':'История сохраняется на устройстве';
-  $('#updated').textContent='Обновлено '+new Date(state.now*1000).toLocaleTimeString('ru-RU')+' · каждые 5 сек';
-  const rate=state.github;$('#rate-info').textContent=rate.remaining>=0?`GitHub: осталось ${rate.remaining} из ${rate.limit} запросов. Лимит обновится ${shortTime(rate.reset)}.`:'';
-  if(rate.retry_at>state.now){$('#global-error').textContent='Пауза по лимиту GitHub до '+shortTime(rate.retry_at)+'. Проверки возобновятся автоматически.';$('#global-error').hidden=false;}else{$('#global-error').hidden=true;}
+  $('#events-list').innerHTML=state.events.length?state.events.map(event=>{const delivery=deliveries[event.delivery]||['',''];return `<article class="event-row"><span class="event-icon" aria-hidden="true">${event.kind==='branch_deleted'?'−':'⑂'}</span><div><div class="event-title">${esc(t(kinds[event.kind]||'changes'))} · <a href="${esc(event.url)}" target="_blank" rel="noopener noreferrer">${esc(event.full_name)}</a></div><div class="event-detail">⑂ ${esc(event.branch)}${event.sha?' · <code>'+esc(event.sha.slice(0,8))+'</code>':''}${event.commit_count!==null?' · '+esc(t('commits',{count:event.commit_count})):''}</div>${event.summary?'<div class="event-detail">'+esc(event.summary)+'</div>':''}${event.error?'<div class="event-detail">'+esc(event.error)+'</div>':''}</div><div class="event-time"><time>${shortTime(event.created)}</time><span class="badge ${delivery[1]}">${delivery[0]?esc(t(delivery[0])):'—'}</span></div></article>`;}).join(''):translatedEmpty(emptyEvents);
+  $('#activity-note').textContent=state.events.length?t('historyLimit'):t('historyLocal');
+  $('#updated').textContent=t('updated',{time:new Date(state.now*1000).toLocaleTimeString(i18n.locale)});
+  const rate=state.github;$('#rate-info').textContent=rate.remaining>=0?t('rate',{remaining:rate.remaining,limit:rate.limit,time:shortTime(rate.reset)}):'';
+  if(rate.retry_at>state.now){$('#global-error').textContent=t('ratePause',{time:shortTime(rate.retry_at)});$('#global-error').hidden=false;}else{$('#global-error').hidden=true;}
 }
-async function refresh(){if(refreshBusy)return;refreshBusy=true;try{state=await api('/api/state');render();}catch(error){$('#global-error').textContent='Не удалось обновить данные. '+error.message;$('#global-error').hidden=false;$('#service-status').textContent='Нет связи с устройством';$('#service-status').className='service-pill';}finally{refreshBusy=false;}}
+async function refresh(){
+  if(refreshBusy){refreshQueued=true;return;}
+  refreshBusy=true;const requestedLanguage=i18n.language;
+  try{
+    const next=await api('/api/state');
+    if(requestedLanguage===i18n.language){state=next;render();}else{refreshQueued=true;}
+  }catch(error){
+    if(requestedLanguage===i18n.language){
+      $('#global-error').textContent=t('refreshError',{message:error.message});$('#global-error').hidden=false;
+      $('#service-status').textContent=t('offline');$('#service-status').className='service-pill';
+    }else{refreshQueued=true;}
+  }finally{
+    refreshBusy=false;if(refreshQueued){refreshQueued=false;refresh();}
+  }
+}
 function repoUrl(){return $('#repo-form').elements.url.value.trim().replace(/\/+$/,'');}
 function branchAvailability(data){
   const form=$('#repo-form'),specific=form.elements.mode.value==='branch';
@@ -55,9 +78,9 @@ function branchAvailability(data){
 function renderBranchChoices(data){
   const form=$('#repo-form'),select=form.elements.branch,status=$('#branch-status');
   const savedMissing=data.loaded&&editingRepo?.mode==='branch'&&editingRepo.url===data.url&&branchWanted===editingRepo.branch&&!data.branches.includes(branchWanted);
-  let placeholder=data.loading?'Загрузка веток…':data.error?'Не удалось загрузить ветки':data.loaded?'В репозитории пока нет веток':'Сначала укажи ссылку на репозиторий';
-  select.innerHTML=`<option value="">${placeholder}</option>`+data.branches.map(branch=>`<option value="${esc(branch)}">${esc(branch)}${branch===data.defaultBranch?' — основная':''}</option>`).join('');
-  if(savedMissing)select.innerHTML+=`<option value="${esc(branchWanted)}">${esc(branchWanted)} — сохранённая, сейчас не найдена</option>`;
+  let placeholder=data.loading?t('branchesLoading'):data.error?t('branchLoadError'):data.loaded?t(data.branches.length?'chooseBranch':'branchesEmpty'):t('enterRepoFirst');
+  select.innerHTML=`<option value="">${placeholder}</option>`+data.branches.map(branch=>`<option value="${esc(branch)}">${esc(branch)}${branch===data.defaultBranch?t('branchDefaultSuffix'):''}</option>`).join('');
+  if(savedMissing)select.innerHTML+=`<option value="${esc(branchWanted)}">${esc(branchWanted)}${t('branchMissingSuffix')}</option>`;
   if(data.loaded){
     select.value=data.branches.includes(branchWanted)||savedMissing?branchWanted:data.branches.includes(data.defaultBranch)?data.defaultBranch:data.branches[0]||'';
     branchWanted=select.value;
@@ -65,10 +88,10 @@ function renderBranchChoices(data){
   select.disabled=repoSaving||data.loading||!data.loaded||(!data.branches.length&&!savedMissing);
   select.setAttribute('aria-busy',String(data.loading));
   status.className=data.error?'form-error':'field-help';
-  status.textContent=data.loading?'Загружаем ветки с GitHub…':data.error?data.error:savedMissing?'Сохранённая ветка сейчас отсутствует на GitHub. Можно оставить наблюдение за ней или выбрать другую.':data.loaded?(data.branches.length?`Найдено веток: ${data.branches.length}.${data.defaultBranch?' Основная: '+data.defaultBranch+'.':''}`:'В репозитории пока нет веток. Можно выбрать «Все ветки».'):'Вставь ссылку на репозиторий — список загрузится автоматически.';
+  status.textContent=data.loading?t('branchesFetching'):data.error?data.error:savedMissing?t('branchMissing'):data.loaded?(data.branches.length?t('branchesFound',{count:data.branches.length})+(data.defaultBranch?t('defaultBranchName',{name:data.defaultBranch}):''):t('branchesEmptyHelp')):t('branchesPaste');
   branchAvailability(data);
 }
-const branchLoader=new GitWatchBranchLoader(url=>api('/api/repos/branches','POST',{url}),renderBranchChoices);
+const branchLoader=new GitWatchBranchLoader(url=>api('/api/repos/branches','POST',{url}),renderBranchChoices,{invalid:()=>t('branchReadError'),failed:()=>t('branchLoadError')});
 function requestBranches(force=false){
   clearTimeout(branchTimer);const url=repoUrl();
   if(!/^(?:https:\/\/github\.com\/|github\.com\/)?[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(url))return;
@@ -77,16 +100,16 @@ function requestBranches(force=false){
 }
 function openRepo(repo=null){
   const form=$('#repo-form');form.reset();editingRepo=repo?{...repo}:null;errorIn(form,null);
-  $('#repo-dialog-title').textContent=repo?'Настройки репозитория':'Добавить репозиторий';
+  $('#repo-dialog-title').textContent=repo?t('repoEdit'):t('repoAdd');
   form.elements.url.disabled=!!repo;form.elements.url.value=repo?.url||'';form.elements.mode.value=repo?.mode||'all';branchWanted=repo?.branch||'';form.elements.interval_minutes.value=repo?.interval_minutes||5;
   branchLoader.reset(repoUrl());$('#repo-dialog').showModal();requestBranches();
 }
 function openSettings(){
-  if(!state){toast('Дождись соединения с устройством.',true);return;}
+  if(!state){toast(t('waitConnection'),true);return;}
   settingsRevision=state.settings.revision;const tg=state.settings.telegram;$('#telegram-form').reset();$('#github-form').reset();errorIn($('#telegram-form'),null);errorIn($('#github-form'),null);
   $('#telegram-form').elements.username.value=tg.username?'@'+tg.username:'';
-  $('#tg-token-note').textContent=tg.configured?'Токен сохранён. Оставь поле пустым, чтобы его не менять.':'Токен хранится только на сервере.';
-  $('#gh-token-note').textContent=state.settings.github_configured?'GitHub-токен сохранён. Введи новый для замены.':'Без токена доступны только публичные репозитории: до 60 запросов в час с одного IP.';
+  $('#tg-token-note').textContent=tg.configured?t('tokenSaved'):t('tokenServer');
+  $('#gh-token-note').textContent=state.settings.github_configured?t('githubTokenSavedNote'):t('githubWithoutToken');
   $('#tg-disconnect').hidden=!tg.configured;$('#gh-remove').hidden=!state.settings.github_configured;$('#settings-dialog').showModal();
 }
 document.addEventListener('click',async event=>{
@@ -94,14 +117,14 @@ document.addEventListener('click',async event=>{
   const button=event.target.closest('[data-action]');if(!button||button.disabled)return;
   const action=button.dataset.action;const repo=state?.repos.find(r=>r.id===Number(button.dataset.id));
   if(action==='add'){openRepo();return;}if(action==='settings'){openSettings();return;}if(action==='edit'&&repo){openRepo(repo);return;}
-  if(action==='delete'&&repo){deleteId=repo.id;$('#confirm-text').textContent=`Наблюдение за ${repo.full_name} прекратится. История изменений останется на сайте.`;errorIn($('#confirm-form'),null);$('#confirm-dialog').showModal();return;}
+  if(action==='delete'&&repo){deleteId=repo.id;$('#confirm-text').textContent=t('confirmRemoveBody',{name:repo.full_name});errorIn($('#confirm-form'),null);$('#confirm-dialog').showModal();return;}
   button.disabled=true;
   try{
-    if(action==='check-all'||action==='check'){await api(action==='check'?`/api/repos/${repo.id}/check`:'/api/check','POST');toast('Проверка запрошена. Результат появится здесь.');}
-    if(action==='toggle'){await api(`/api/repos/${repo.id}`,'PATCH',{enabled:!repo.enabled,revision:repo.revision});toast(repo.enabled?'Мониторинг приостановлен.':'Мониторинг возобновлён.');}
-    if(action==='test'){await api('/api/telegram/test','POST');toast('Тестовое сообщение отправлено.');}
-    if(action==='disconnect'){await api('/api/telegram/disconnect','POST');$('#settings-dialog').close();toast('Telegram отключён.');}
-    if(action==='remove-github'){await api('/api/github','PUT',{token:'',revision:settingsRevision});$('#settings-dialog').close();toast('GitHub-токен удалён.');}
+    if(action==='check-all'||action==='check'){await api(action==='check'?`/api/repos/${repo.id}/check`:'/api/check','POST');toast(t('checkRequested'));}
+    if(action==='toggle'){await api(`/api/repos/${repo.id}`,'PATCH',{enabled:!repo.enabled,revision:repo.revision});toast(repo.enabled?t('monitoringPaused'):t('monitoringResumed'));}
+    if(action==='test'){await api('/api/telegram/test','POST');toast(t('testSent'));}
+    if(action==='disconnect'){await api('/api/telegram/disconnect','POST');$('#settings-dialog').close();toast(t('telegramDisconnected'));}
+    if(action==='remove-github'){await api('/api/github','PUT',{token:'',revision:settingsRevision});$('#settings-dialog').close();toast(t('githubTokenRemoved'));}
     await refresh();
   }catch(error){toast(error.message,true);}finally{button.disabled=false;}
 });
@@ -111,13 +134,38 @@ $('#repo-form [name=url]').addEventListener('change',()=>requestBranches());
 $('#repo-form [name=branch]').addEventListener('change',event=>{branchWanted=event.target.value;branchAvailability(branchLoader.state);});
 $('#refresh-branches').addEventListener('click',()=>requestBranches(true));
 $('#repo-dialog').addEventListener('close',()=>{clearTimeout(branchTimer);branchLoader.reset();});
-$('#repo-form').addEventListener('submit',async event=>{event.preventDefault();const form=event.currentTarget;repoSaving=true;await submit(form,async()=>{const data={mode:form.elements.mode.value,branch:form.elements.branch.value,interval_minutes:Number(form.elements.interval_minutes.value)};if(data.mode==='branch'&&(!branchLoader.state.loaded||branchLoader.state.loading||!data.branch))throw new Error('Дождись загрузки веток и выбери ветку из списка.');if(editingRepo){data.revision=editingRepo.revision;await api(`/api/repos/${editingRepo.id}`,'PATCH',data);}else{data.url=form.elements.url.value;await api('/api/repos','POST',data);}$('#repo-dialog').close();toast(editingRepo?'Настройки сохранены.':'Репозиторий добавлен. Начинаем наблюдение.');});repoSaving=false;branchAvailability(branchLoader.state);});
-$('#telegram-form').addEventListener('submit',event=>{event.preventDefault();const form=event.currentTarget;submit(form,async()=>{await api('/api/telegram','PUT',{token:form.elements.token.value.trim(),username:form.elements.username.value.trim(),revision:settingsRevision});form.elements.token.value='';$('#settings-dialog').close();toast('Telegram сохранён. Отправь боту /start для привязки.');});});
-$('#github-form').addEventListener('submit',event=>{event.preventDefault();const form=event.currentTarget;submit(form,async()=>{if(!form.elements.token.value.trim())throw new Error('Введи GitHub-токен. Для удаления используй отдельную кнопку.');await api('/api/github','PUT',{token:form.elements.token.value.trim(),revision:settingsRevision});form.elements.token.value='';$('#settings-dialog').close();toast('GitHub-токен сохранён.');});});
-$('#confirm-form').addEventListener('submit',event=>{event.preventDefault();submit(event.currentTarget,async()=>{await api(`/api/repos/${deleteId}`,'DELETE');$('#confirm-dialog').close();toast('Репозиторий удалён.');});});
+$('#repo-form').addEventListener('submit',async event=>{event.preventDefault();const form=event.currentTarget;repoSaving=true;await submit(form,async()=>{const data={mode:form.elements.mode.value,branch:form.elements.branch.value,interval_minutes:Number(form.elements.interval_minutes.value)};if(data.mode==='branch'&&(!branchLoader.state.loaded||branchLoader.state.loading||!data.branch))throw new Error(t('waitBranches'));if(editingRepo){data.revision=editingRepo.revision;await api(`/api/repos/${editingRepo.id}`,'PATCH',data);}else{data.url=form.elements.url.value;await api('/api/repos','POST',data);}$('#repo-dialog').close();toast(editingRepo?t('settingsSaved'):t('repoAdded'));});repoSaving=false;branchAvailability(branchLoader.state);});
+$('#telegram-form').addEventListener('submit',event=>{event.preventDefault();const form=event.currentTarget;submit(form,async()=>{await api('/api/telegram','PUT',{token:form.elements.token.value.trim(),username:form.elements.username.value.trim(),revision:settingsRevision});form.elements.token.value='';$('#settings-dialog').close();toast(t('telegramSaved'));});});
+$('#github-form').addEventListener('submit',event=>{event.preventDefault();const form=event.currentTarget;submit(form,async()=>{if(!form.elements.token.value.trim())throw new Error(t('enterGithubToken'));await api('/api/github','PUT',{token:form.elements.token.value.trim(),revision:settingsRevision});form.elements.token.value='';$('#settings-dialog').close();toast(t('githubTokenSaved'));});});
+$('#confirm-form').addEventListener('submit',event=>{event.preventDefault();submit(event.currentTarget,async()=>{await api(`/api/repos/${deleteId}`,'DELETE');$('#confirm-dialog').close();toast(t('repoRemoved'));});});
 for(const dialog of document.querySelectorAll('dialog'))dialog.addEventListener('close',()=>{for(const input of dialog.querySelectorAll('input[type=password]'))input.value='';});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh();});
-setInterval(()=>{if(!document.hidden)refresh();},5000);refresh();
+function settingsNotes(){
+  if(!state)return;
+  $('#tg-token-note').textContent=t(state.settings.telegram.configured?'tokenSaved':'tokenServer');
+  $('#gh-token-note').textContent=t(state.settings.github_configured?'githubTokenSavedNote':'githubWithoutToken');
+}
+function translatePage(){
+  document.documentElement.lang=i18n.language;document.title=t('title');i18n.apply(document);
+  $('#language-select').value=i18n.language;
+  $('#repo-dialog-title').textContent=t(editingRepo?'repoEdit':'repoAdd');
+  const deleting=state?.repos.find(repo=>repo.id===deleteId);
+  if(deleting)$('#confirm-text').textContent=t('confirmRemoveBody',{name:deleting.full_name});
+  for(const input of document.querySelectorAll('input,select'))input.setCustomValidity('');
+  $('#toast').hidden=true;settingsNotes();if(state)render();renderBranchChoices(branchLoader.state);
+}
+function changeLanguage(language){
+  if(!i18n.setLanguage(language))return;
+  translatePage();
+  if($('#repo-dialog').open&&(branchLoader.state.loading||branchLoader.state.error))requestBranches(true);
+  refresh();
+}
+$('#language-select').addEventListener('change',event=>changeLanguage(event.target.value));
+window.addEventListener('storage',event=>{if(event.key===GitWatchI18n.storageKey&&event.newValue!==i18n.language)changeLanguage(event.newValue);});
+document.addEventListener('invalid',event=>event.target.setCustomValidity(t(event.target.name==='interval_minutes'?'invalidInterval':'required')),true);
+document.addEventListener('reset',event=>{for(const field of event.target.elements)field.setCustomValidity?.('');});
+for(const name of ['input','change'])document.addEventListener(name,event=>event.target.setCustomValidity?.(''));
+translatePage();setInterval(()=>{if(!document.hidden)refresh();},5000);refresh();
 
 // Progressive enhancement: the visible forms remain the primary interface.
 const modelContext=document.modelContext;

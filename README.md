@@ -10,9 +10,9 @@
 
 Watch GitHub repositories and get Telegram notifications when branches change. Choose the branches and polling interval for each repository; Git Watch keeps checking while your browser is closed.
 
-![Git Watch dashboard with monitored repositories, Telegram status and recent changes](assets/screenshots/dashboard.png)
+![Git Watch dashboard with monitored repositories, Telegram status and recent changes](assets/screenshots/en/dashboard.png)
 
-<p align="center"><sub>Actual interface with demonstration data. The application UI is currently in Russian.</sub></p>
+<p align="center"><sub>Actual English interface with demonstration data. Switch between English and Russian using EN / RU in the top bar.</sub></p>
 
 ## Features
 
@@ -48,19 +48,21 @@ py -3 -m venv .venv
 
 Open **http://127.0.0.1:8788**. Keep the process running; press `Ctrl+C` to stop it.
 
-1. In **Settings / Настройки**, enter a dedicated [BotFather](https://t.me/BotFather) bot token and your Telegram username. Save, then send `/start` to your bot.
+The dashboard starts in your browser's language (English or Russian). Your selection in **EN / RU** is saved in the browser.
+
+1. In **Settings**, enter a dedicated [BotFather](https://t.me/BotFather) bot token and your Telegram username. Save, then send `/start` to your bot.
 2. Add a GitHub token if you need private repositories or a higher request limit. A fine-grained token needs **Contents: Read-only** for the selected repositories.
-3. Click **Add / Добавить**, paste a repository URL, and choose branches and an interval. The first check establishes a baseline; notifications start with subsequent changes.
+3. Click **Add**, paste a repository URL, and choose branches and an interval. The first check establishes a baseline; notifications start with subsequent changes.
 
 ## Screenshots
 
 | Choose a branch and interval | Connect Telegram and GitHub |
 | --- | --- |
-| [![Repository setup with a branch selected](assets/screenshots/repository-setup.png)](assets/screenshots/repository-setup.png) | [![Connection settings with empty token fields and demo account details](assets/screenshots/settings.png)](assets/screenshots/settings.png) |
+| [![Repository setup with a branch selected](assets/screenshots/en/repository-setup.png)](assets/screenshots/en/repository-setup.png) | [![Connection settings with empty token fields and demo account details](assets/screenshots/en/settings.png)](assets/screenshots/en/settings.png) |
 
 <details>
 <summary>On your phone</summary>
-<p align="center"><a href="assets/screenshots/mobile.png"><img src="assets/screenshots/mobile.png" width="360" alt="Git Watch dashboard on a phone"></a></p>
+<p align="center"><a href="assets/screenshots/en/mobile.png"><img src="assets/screenshots/en/mobile.png" width="360" alt="Git Watch dashboard on a phone"></a></p>
 </details>
 
 ## Run automatically on Raspberry Pi / Linux
