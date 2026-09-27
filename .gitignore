@@ -5,6 +5,13 @@ venv/
 data/
 backups/
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+telegram-proxy*.json
 *.sqlite3*
 .pytest_cache/
 .coverage
